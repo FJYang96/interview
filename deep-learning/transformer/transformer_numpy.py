@@ -14,8 +14,10 @@ def layer_norm(x, gamma, beta, eps=1e-5):
     Returns:
         np.ndarray of shape (batch_size, seq_len, d_model)
     """
-    x_normed = (x - x.mean(-1, keepdims=True)) / (x.std(-1, keepdims=True) + eps)
-    return x_normed * gamma + beta
+    x_normed = (x - x.mean(-1, keepdims=True)) / (
+        x.std(-1, keepdims=True) + eps
+    )  # (B, L, d_m)
+    return gamma * x_normed + beta
 
 
 def get_positional_encoding(seq_len, d_model):
@@ -28,13 +30,21 @@ def get_positional_encoding(seq_len, d_model):
 
     Returns:
         np.ndarray of shape (seq_len, d_model)
+
+    n, 2k    : sin(n / (10000)**(2k / d_model))
+    n, 2k + 1: cos(n / (10000)**(2k / d_model))
     """
-    pe = np.zeros((seq_len, d_model))
-    pos = np.arange(seq_len)[:, None]
-    div_term = np.exp(np.log(1e-4) * (np.arange(d_model)[0::2] / d_model))
-    pe[:, 0::2] = np.sin(pos * div_term)
-    pe[:, 1::2] = np.cos(pos * div_term)
-    return pe
+    pos_emb = np.zeros((seq_len, d_model))
+    div_term = np.exp(
+        -np.log(1e4) * (np.arange(d_model)[0::2] / d_model)
+    )  # (d_model // 2,)
+    pos_emb[:, 0::2] = np.sin(
+        np.arange(seq_len)[:, None] * div_term
+    )  # (seq_len, d_model // 2)
+    pos_emb[:, 1::2] = np.cos(
+        np.arange(seq_len)[:, None] * div_term
+    )  # (seq_len, d_model // 2)
+    return pos_emb
 
 
 def scaled_dot_product_attention(Q, K, V, mask=None):
@@ -50,14 +60,14 @@ def scaled_dot_product_attention(Q, K, V, mask=None):
     Returns:
         tuple: (attention_output, attention_weights)
     """
-    d_k = Q.shape[-1]
-    score = Q @ K.swapaxes(2, 3) / np.sqrt(d_k)  # (b, h, l, l)
+    B, H, L, d_k = Q.shape
+    score = Q @ K.swapaxes(-1, -2) / np.sqrt(d_k)  # (B, H, L, L)
     if mask is not None:
         score = np.where(mask, score, -1e9)
     score -= score.max(-1, keepdims=True)
     score_exp = np.exp(score)
-    weight = score_exp / score_exp.sum(-1, keepdims=True)
-    return weight @ V, weight
+    weights = score_exp / score_exp.sum(-1, keepdims=True)  # (B, H, L, L)
+    return weights @ V, weights
 
 
 def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads, mask=None):
@@ -74,11 +84,12 @@ def multi_head_attention(x, W_q, W_k, W_v, W_o, num_heads, mask=None):
     Returns:
         np.ndarray of shape (batch_size, seq_len, d_model)
     """
-    Q = np.stack(np.split(x @ W_q, num_heads, -1), 1)  # (b, h, l, d)
-    K = np.stack(np.split(x @ W_k, num_heads, -1), 1)
-    V = np.stack(np.split(x @ W_v, num_heads, -1), 1)
-    out, _ = scaled_dot_product_attention(Q, K, V, mask)  # (b, h, l, d)
-    return out.transpose(0, 2, 1, 3).reshape(x.shape) @ W_o
+    B, L, d_model = x.shape
+    Q = (x @ W_q).reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)  # (B, H, L, d_k)
+    K = (x @ W_k).reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)  # (B, H, L, d_k)
+    V = (x @ W_v).reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)  # (B, H, L, d_k)
+    O, _ = scaled_dot_product_attention(Q, K, V, mask)  # (B, H, L, d_k)
+    return O.transpose(0, 2, 1, 3).reshape(B, L, -1) @ W_o
 
 
 def moe_layer(x, W_gate, experts_W1, experts_W2, top_k=2):
@@ -95,27 +106,28 @@ def moe_layer(x, W_gate, experts_W1, experts_W2, top_k=2):
     Returns:
         np.ndarray of shape (batch_size, seq_len, d_model)
     """
-    # Find expert weights
-    logits = x @ W_gate  # (B, L, E)
-    logits -= logits.max(-1, keepdims=True)
+    B, L, d = x.shape
+    y = np.zeros_like(x)
 
-    # Forward pass
-    B, L, d_model = x.shape
-    out = np.zeros_like(x)
     for b in range(B):
         for l in range(L):
-            exp_logits = logits[b, l]
-            exp_inds = np.argpartition(-exp_logits, top_k)[:top_k]  # (k,)
-            hidden = np.maximum(
-                0, x[b, l, None, :] @ experts_W1[exp_inds, :, :]
-            )  # (1, d_model) @ (k, d_model, d_ff) -> (k, 1, d_ff)
-            y = np.squeeze(hidden @ experts_W2[exp_inds, :, :], axis=1)  # (k, d_model)
-            exp_weights = np.exp(exp_logits[exp_inds]) / np.sum(
-                np.exp(exp_logits[exp_inds])
-            )  # (k,)
-            out[b, l] = np.sum(y * exp_weights[:, None], axis=0)
+            # Read out the current token
+            x_tok = x[b, l]  # (d_model,)
 
-    return out
+            # Find out experts to activate
+            cos_sim = W_gate.T @ x_tok  # (num_experts,)
+            exp_inds = np.argpartition(cos_sim, -top_k)[-top_k:]  # (top_k,)
+            exp_weights = np.exp(cos_sim[exp_inds] - cos_sim.max())
+            exp_weights = exp_weights / exp_weights.sum()
+
+            # Feedforward computation
+            y_tok = np.zeros_like(x_tok)
+            for ind, weight in zip(exp_inds, exp_weights):
+                h = np.maximum(0, experts_W1[ind].T @ x_tok)  # (d_ff,)
+                y_tok += weight * (experts_W2[ind].T @ h)  # (d_model,)
+            y[b, l] = y_tok
+
+    return y
 
 
 def transformer_block(

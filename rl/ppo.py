@@ -25,19 +25,17 @@ def compute_gae(rewards, values, dones, last_value, gamma=0.99, gae_lambda=0.95)
         advantages (Tensor): shape (T,)
         returns (Tensor): shape (T,)
     """
-    # GAE formula: \sum_t (lambda * gamma)^t (r_t + gamma * V(s_t+1) - V(s_t))
+    # GAE formula: (gamma * lambda)^t * (r_t + gamma * V(s_t+1) - V(s_t))
     T = len(rewards)
-    advantages = torch.zeros((T,))
+    advantages = torch.zeros_like(rewards)
     last_gae = 0
     for t in reversed(range(T)):
-        next_value = values[t + 1] if t + 1 < T else last_value
-        target = rewards[t] + gamma * (1 - dones[t]) * next_value - values[t]
+        next_value = values[t + 1] if t < T - 1 else last_value
+        target = rewards[t] + (1 - dones[t]) * gamma * next_value - values[t]
         advantages[t] = last_gae = (
-            target + (1 - dones[t]) * gae_lambda * gamma * last_gae
+            target + gamma * gae_lambda * (1 - dones[t]) * last_gae
         )
-    returns = advantages + values
-
-    return advantages, returns
+    return advantages, values + advantages
 
 
 # ==========================================
@@ -104,8 +102,9 @@ def ppo_loss(
     if entropy is None:
         entropy_loss = 0
     else:
-        entropy_loss = -ent_coef * entropy.mean()
-    total_loss = policy_loss + value_loss + entropy_loss
+        entropy_loss = -entropy.mean()
+
+    total_loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
 
     return total_loss, policy_loss, value_loss
 

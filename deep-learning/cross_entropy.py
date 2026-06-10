@@ -11,19 +11,18 @@ class CrossEntropyLoss:
         y shape: (batch_size,) - Integer class labels
         Returns: Scalar loss
         """
-        bs, _ = logits.shape
-
         # Find the probability
-        logits_normalized = logits - logits.max(1, keepdims=True)
-        logits_exp = np.exp(logits_normalized)
-        prob = logits_exp / logits_exp.sum(1, keepdims=True)
+        B, _ = logits.shape
+        logits_normed = logits - logits.max(-1, keepdims=True)
+        logits_exp = np.exp(logits_normed)
+        probs = logits_exp / logits_exp.sum(-1, keepdims=True)
 
-        # Find the loss
-        prob_true = prob[np.arange(bs), y]  # (bs,)
-        loss = -np.log(prob_true + 1e-15).sum() / bs
+        # Compute the loss
+        probs_pred = probs[np.arange(B), y]
+        loss = -np.log(probs_pred + 1e-10).mean()
 
-        self.cache = prob, y
-
+        # Cache inputs
+        self.cache = probs, y
         return loss
 
     def backward(self):
@@ -33,11 +32,11 @@ class CrossEntropyLoss:
         if self.cache is None:
             raise Exception("Attempt to backprop without forward pass.")
 
-        probs, y = self.cache
-        bs = probs.shape[0]
-        dL_dz = probs
-        dL_dz[np.arange(bs), y] -= 1
-        dL_dz /= bs
+        probs, y = self.cache  # (B, C), (B,)
+        B, _ = probs.shape
+        dL_dz = probs.copy()
+        dL_dz[np.arange(B), y] -= 1
+        dL_dz /= B
 
         return dL_dz
 
